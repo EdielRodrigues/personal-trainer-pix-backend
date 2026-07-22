@@ -1,7 +1,6 @@
 {
   "name": "personal-trainer-pix-backend",
   "version": "1.0.0",
-  "description": "Backend Pix Mercado Pago e Firebase",
   "private": true,
   "main": "index.js",
   "scripts": {
