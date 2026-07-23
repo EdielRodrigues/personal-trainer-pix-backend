@@ -1,0 +1,5 @@
+ATUALIZAÇÃO V6
+Nova rota POST /admin/cancelPayment.
+- pending/in_process/authorized: cancela no Mercado Pago.
+- approved: solicita reembolso integral e bloqueia o acesso vinculado.
+Suba esta versão no GitHub e faça novo deploy no Render.

@@ -101,6 +101,19 @@ async function authenticate(req, res, next) {
   }
 }
 
+async function authenticateAdmin(req, res, next) {
+  return authenticate(req, res, async () => {
+    try {
+      const profile = (await db.ref(`users/${req.user.uid}`).once('value')).val();
+      if (profile?.role !== 'admin') return res.status(403).json({ error: 'Acesso permitido somente para administrador.' });
+      req.adminProfile = profile;
+      return next();
+    } catch (error) {
+      return res.status(500).json({ error: 'Não foi possível validar o administrador.' });
+    }
+  });
+}
+
 function paymentIdFromRequest(req) {
   return String(
     req.query['data.id'] ||
@@ -239,6 +252,8 @@ app.post('/createPix', authenticate, async (req, res) => {
       planId,
       planName: plan.name,
       amount: Number(plan.value),
+      paymentMethod: 'pix',
+      paymentMethodId: 'pix',
       status: payment.status || 'pending',
       statusDetail: payment.status_detail || '',
       mercadoPagoId: String(payment.id),
@@ -256,6 +271,65 @@ app.post('/createPix', authenticate, async (req, res) => {
   } catch (error) {
     console.error('createPix:', error);
     res.status(500).json({ error: error.message || 'Não foi possível gerar o Pix.' });
+  }
+});
+
+
+app.post('/createCardPayment', authenticate, async (req, res) => {
+  try {
+    const planId = String(req.body.planId || '').trim();
+    const plan = PLANS[planId];
+    if (!plan) return res.status(400).json({ error: 'Plano inválido.' });
+    const profile = (await db.ref(`users/${req.user.uid}`).once('value')).val();
+    if (!profile) return res.status(404).json({ error: 'Cadastro do usuário não encontrado.' });
+    const token = String(req.body.token || '').trim();
+    const paymentMethodId = String(req.body.payment_method_id || req.body.paymentMethodId || '').trim();
+    const issuerId = req.body.issuer_id || req.body.issuerId || undefined;
+    const installments = Math.max(1, Number(req.body.installments || 1));
+    const payerForm = req.body.payer || {};
+    const email = payerForm.email || profile.email || req.user.email || '';
+    const cpf = onlyNumbers(payerForm.identification?.number || profile.cpf);
+    if (!token || !paymentMethodId) return res.status(400).json({ error: 'Dados do cartão incompletos.' });
+    if (!email) return res.status(400).json({ error: 'E-mail não cadastrado.' });
+    if (cpf.length !== 11) return res.status(400).json({ error: 'CPF inválido.' });
+    const externalReference = `${req.user.uid}|${planId}`;
+    const payment = await mpRequest('/v1/payments', {
+      method: 'POST',
+      headers: { 'X-Idempotency-Key': crypto.randomUUID() },
+      body: JSON.stringify({
+        transaction_amount: Number(plan.value),
+        token,
+        description: `Personal Trainer Avançado Pro - ${plan.name}`,
+        installments,
+        payment_method_id: paymentMethodId,
+        ...(issuerId ? { issuer_id: issuerId } : {}),
+        external_reference: externalReference,
+        payer: { email, identification: { type: 'CPF', number: cpf } },
+        metadata: { firebase_uid: req.user.uid, plan_id: planId, plan_name: plan.name, payment_method: 'card' }
+      })
+    });
+    const now = new Date().toISOString();
+    const record = {
+      userId: req.user.uid,
+      userName: profile.name || '',
+      userEmail: email,
+      userCpfLast4: cpf.slice(-4),
+      planId, planName: plan.name, amount: Number(plan.value),
+      paymentMethod: 'card', paymentMethodId,
+      installments,
+      status: payment.status || 'pending',
+      statusDetail: payment.status_detail || '',
+      mercadoPagoId: String(payment.id),
+      externalReference: payment.external_reference || externalReference,
+      createdAt: now, updatedAt: now
+    };
+    await db.ref(`payments/${payment.id}`).set(record);
+    await syncPayment(payment, record);
+    const updated = (await db.ref(`payments/${payment.id}`).once('value')).val();
+    res.status(201).json({ success: true, payment: { id: String(payment.id), ...updated } });
+  } catch (error) {
+    console.error('createCardPayment:', error);
+    res.status(500).json({ error: error.message || 'Não foi possível processar o cartão.' });
   }
 });
 
@@ -296,6 +370,69 @@ app.get('/latestPayment', authenticate, async (req, res) => {
   } catch (error) {
     console.error('latestPayment:', error);
     res.status(500).json({ error: error.message || 'Não foi possível buscar o pagamento.' });
+  }
+});
+
+
+app.post('/admin/cancelPayment', authenticateAdmin, async (req, res) => {
+  try {
+    const paymentId = String(req.body.paymentId || '').trim();
+    if (!paymentId) return res.status(400).json({ error: 'ID do pagamento não informado.' });
+
+    const ref = db.ref(`payments/${paymentId}`);
+    const local = (await ref.once('value')).val();
+    if (!local) return res.status(404).json({ error: 'Pagamento não encontrado no Firebase.' });
+
+    const current = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+    const now = new Date().toISOString();
+    let result;
+    let finalStatus;
+    let action;
+
+    if (current.status === 'approved') {
+      result = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}/refunds`, {
+        method: 'POST',
+        headers: { 'X-Idempotency-Key': crypto.randomUUID() },
+        body: JSON.stringify({})
+      });
+      finalStatus = 'refunded';
+      action = 'refund';
+      const userRef = db.ref(`users/${local.userId}`);
+      const user = (await userRef.once('value')).val() || {};
+      if (String(user.lastPaymentId || '') === paymentId) {
+        await userRef.update({
+          status: 'bloqueado',
+          expiresAt: now,
+          paymentReversedAt: now,
+          updatedAt: now
+        });
+      }
+    } else if (['pending', 'in_process', 'authorized'].includes(current.status)) {
+      result = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`, {
+        method: 'PUT',
+        body: JSON.stringify({ status: 'cancelled' })
+      });
+      finalStatus = result.status || 'cancelled';
+      action = 'cancel';
+    } else if (['cancelled', 'refunded', 'charged_back'].includes(current.status)) {
+      return res.status(409).json({ error: `Pagamento já está ${current.status}.` });
+    } else {
+      return res.status(409).json({ error: `Não é possível cancelar um pagamento com status ${current.status}.` });
+    }
+
+    await ref.update({
+      status: finalStatus,
+      adminAction: action,
+      adminActionBy: req.user.uid,
+      adminActionAt: now,
+      refundId: result?.id ? String(result.id) : '',
+      updatedAt: now
+    });
+
+    return res.json({ success: true, action, status: finalStatus });
+  } catch (error) {
+    console.error('admin/cancelPayment:', error);
+    return res.status(500).json({ error: error.message || 'Não foi possível cancelar ou reembolsar o pagamento.' });
   }
 });
 

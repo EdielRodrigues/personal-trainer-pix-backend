@@ -1,0 +1,3 @@
+VERSÃO 7 — BACKEND PIX + CARTÃO
+
+Nova rota POST /createCardPayment. O Access Token continua somente no Render.
