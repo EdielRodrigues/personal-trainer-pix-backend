@@ -287,6 +287,7 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
     const issuerId = req.body.issuer_id || req.body.issuerId || undefined;
     const installments = Math.max(1, Number(req.body.installments || 1));
     const payerForm = req.body.payer || {};
+    const requestedPaymentType = String(req.body.requestedPaymentType || 'credit_card').trim();
     const email = payerForm.email || profile.email || req.user.email || '';
     const cpf = onlyNumbers(payerForm.identification?.number || profile.cpf);
     if (!token || !paymentMethodId) return res.status(400).json({ error: 'Dados do cartão incompletos.' });
@@ -305,7 +306,7 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
         ...(issuerId ? { issuer_id: issuerId } : {}),
         external_reference: externalReference,
         payer: { email, identification: { type: 'CPF', number: cpf } },
-        metadata: { firebase_uid: req.user.uid, plan_id: planId, plan_name: plan.name, payment_method: 'card' }
+        metadata: { firebase_uid: req.user.uid, plan_id: planId, plan_name: plan.name, payment_method: requestedPaymentType }
       })
     });
     const now = new Date().toISOString();
@@ -315,8 +316,8 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
       userEmail: email,
       userCpfLast4: cpf.slice(-4),
       planId, planName: plan.name, amount: Number(plan.value),
-      paymentMethod: 'card', paymentMethodId,
-      installments,
+      paymentMethod: payment.payment_type_id === 'debit_card' ? 'debit_card' : 'credit_card', paymentTypeId: payment.payment_type_id || requestedPaymentType, paymentMethodId,
+      installments: payment.payment_type_id === 'debit_card' ? 1 : installments,
       status: payment.status || 'pending',
       statusDetail: payment.status_detail || '',
       mercadoPagoId: String(payment.id),
@@ -383,53 +384,69 @@ app.post('/admin/cancelPayment', authenticateAdmin, async (req, res) => {
     const local = (await ref.once('value')).val();
     if (!local) return res.status(404).json({ error: 'Pagamento não encontrado no Firebase.' });
 
-    const current = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+    let current = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
     const now = new Date().toISOString();
-    let result;
-    let finalStatus;
-    let action;
+    const amount = Number(current.transaction_amount || local.amount || 0);
+    const refundedAmount = Number(current.transaction_details?.total_refunded_amount || 0);
 
+    // Se o Mercado Pago já concluiu a reversão, apenas sincroniza o painel.
+    if (current.status === 'refunded' || (amount > 0 && refundedAmount >= amount)) {
+      await ref.update({status:'refunded', adminAction:'refund', adminActionBy:req.user.uid, adminActionAt:now, updatedAt:now});
+      return res.json({success:true, action:'refund', status:'refunded', alreadyDone:true, message:'Pagamento já estava reembolsado e foi sincronizado.'});
+    }
+    if (current.status === 'cancelled') {
+      await ref.update({status:'cancelled', adminAction:'cancel', adminActionBy:req.user.uid, adminActionAt:now, updatedAt:now});
+      return res.json({success:true, action:'cancel', status:'cancelled', alreadyDone:true, message:'Pagamento já estava cancelado e foi sincronizado.'});
+    }
+
+    let action, finalStatus, refundId='';
     if (current.status === 'approved') {
-      result = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}/refunds`, {
-        method: 'POST',
-        headers: { 'X-Idempotency-Key': crypto.randomUUID() },
-        body: JSON.stringify({})
-      });
-      finalStatus = 'refunded';
       action = 'refund';
+      try {
+        const refund = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}/refunds`, {
+          method: 'POST',
+          headers: { 'X-Idempotency-Key': `refund-${paymentId}` },
+          body: JSON.stringify({})
+        });
+        refundId = refund?.id ? String(refund.id) : '';
+      } catch (refundError) {
+        // A devolução pode ter sido processada antes de a resposta chegar. Confere novamente.
+        current = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+        const total = Number(current.transaction_details?.total_refunded_amount || 0);
+        if (!(current.status === 'refunded' || (amount > 0 && total >= amount))) throw refundError;
+      }
+      current = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+      finalStatus = current.status === 'refunded' || Number(current.transaction_details?.total_refunded_amount || 0) >= amount ? 'refunded' : 'refunded';
+
       const userRef = db.ref(`users/${local.userId}`);
       const user = (await userRef.once('value')).val() || {};
       if (String(user.lastPaymentId || '') === paymentId) {
-        await userRef.update({
-          status: 'bloqueado',
-          expiresAt: now,
-          paymentReversedAt: now,
-          updatedAt: now
-        });
+        await userRef.update({status:'bloqueado', expiresAt:now, paymentReversedAt:now, updatedAt:now}).catch(err=>console.error('Falha ao bloquear acesso após reembolso:',err));
       }
     } else if (['pending', 'in_process', 'authorized'].includes(current.status)) {
-      result = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`, {
+      action = 'cancel';
+      const cancelled = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`, {
         method: 'PUT',
         body: JSON.stringify({ status: 'cancelled' })
       });
-      finalStatus = result.status || 'cancelled';
-      action = 'cancel';
-    } else if (['cancelled', 'refunded', 'charged_back'].includes(current.status)) {
-      return res.status(409).json({ error: `Pagamento já está ${current.status}.` });
+      finalStatus = cancelled.status || 'cancelled';
+    } else if (current.status === 'charged_back') {
+      finalStatus = 'charged_back'; action = 'refund';
     } else {
       return res.status(409).json({ error: `Não é possível cancelar um pagamento com status ${current.status}.` });
     }
 
     await ref.update({
       status: finalStatus,
+      statusDetail: current.status_detail || local.statusDetail || '',
       adminAction: action,
       adminActionBy: req.user.uid,
       adminActionAt: now,
-      refundId: result?.id ? String(result.id) : '',
+      refundId,
       updatedAt: now
     });
 
-    return res.json({ success: true, action, status: finalStatus });
+    return res.json({success:true, action, status:finalStatus, message:action==='refund'?'Reembolso realizado e painel atualizado.':'Pagamento cancelado e painel atualizado.'});
   } catch (error) {
     console.error('admin/cancelPayment:', error);
     return res.status(500).json({ error: error.message || 'Não foi possível cancelar ou reembolsar o pagamento.' });

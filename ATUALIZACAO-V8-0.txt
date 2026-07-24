@@ -1,0 +1,5 @@
+BACKEND V8.0
+
+- Suporte a cartão de débito pelo Card Payment Brick.
+- Registra payment_type_id real retornado pelo Mercado Pago.
+- Reembolso idempotente e sincronização robusta com Firebase.
