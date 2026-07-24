@@ -1,0 +1,5 @@
+BACKEND — V8.1
+
+- Mantém o tipo real devolvido pelo Mercado Pago.
+- Registra também o tipo solicitado pelo cliente para auditoria.
+- Compatível com o cliente V8.1.
