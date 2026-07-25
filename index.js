@@ -256,6 +256,7 @@ app.post('/createPix', authenticate, async (req, res) => {
       paymentMethodId: 'pix',
       status: payment.status || 'pending',
       statusDetail: payment.status_detail || '',
+      deviceIdSent: Boolean(deviceSessionId),
       mercadoPagoId: String(payment.id),
       qrCode: transaction.qr_code || '',
       qrCodeBase64: transaction.qr_code_base64 || '',
@@ -288,15 +289,21 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
     const installments = Math.max(1, Number(req.body.installments || 1));
     const payerForm = req.body.payer || {};
     const requestedPaymentType = String(req.body.requestedPaymentType || 'credit_card').trim();
+    const deviceSessionId = String(req.body.deviceSessionId || req.headers['x-meli-session-id'] || '').trim();
     const email = payerForm.email || profile.email || req.user.email || '';
     const cpf = onlyNumbers(payerForm.identification?.number || profile.cpf);
+    const phone = onlyNumbers(profile.phone || profile.telefone || '');
+    const { firstName, lastName } = splitName(profile.name || payerForm.first_name || payerForm.firstName || 'Cliente');
     if (!token || !paymentMethodId) return res.status(400).json({ error: 'Dados do cartão incompletos.' });
     if (!email) return res.status(400).json({ error: 'E-mail não cadastrado.' });
     if (cpf.length !== 11) return res.status(400).json({ error: 'CPF inválido.' });
     const externalReference = `${req.user.uid}|${planId}`;
     const payment = await mpRequest('/v1/payments', {
       method: 'POST',
-      headers: { 'X-Idempotency-Key': crypto.randomUUID() },
+      headers: {
+        'X-Idempotency-Key': crypto.randomUUID(),
+        ...(deviceSessionId ? { 'X-meli-session-id': deviceSessionId } : {})
+      },
       body: JSON.stringify({
         transaction_amount: Number(plan.value),
         token,
@@ -305,8 +312,29 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
         payment_method_id: paymentMethodId,
         ...(issuerId ? { issuer_id: issuerId } : {}),
         external_reference: externalReference,
-        payer: { email, identification: { type: 'CPF', number: cpf } },
-        metadata: { firebase_uid: req.user.uid, plan_id: planId, plan_name: plan.name, payment_method: requestedPaymentType }
+        payer: {
+          email,
+          first_name: firstName,
+          last_name: lastName,
+          identification: { type: 'CPF', number: cpf },
+          ...(phone.length >= 10 ? { phone: { area_code: phone.slice(0, 2), number: phone.slice(2) } } : {})
+        },
+        additional_info: {
+          items: [{
+            id: planId,
+            title: `Personal Trainer Avançado Pro - ${plan.name}`,
+            description: `${plan.days} dias de acesso ao aplicativo`,
+            category_id: 'services',
+            quantity: 1,
+            unit_price: Number(plan.value)
+          }],
+          payer: {
+            first_name: firstName,
+            last_name: lastName,
+            ...(phone.length >= 10 ? { phone: { area_code: phone.slice(0, 2), number: phone.slice(2) } } : {})
+          }
+        },
+        metadata: { firebase_uid: req.user.uid, plan_id: planId, plan_name: plan.name, payment_method: requestedPaymentType, device_id_sent: Boolean(deviceSessionId) }
       })
     });
     const now = new Date().toISOString();

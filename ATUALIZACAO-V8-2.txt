@@ -1,0 +1,6 @@
+ATUALIZAÇÃO V8.2 — CARTÃO E ANTIFRAUDE
+
+- Recebe Device ID do cliente.
+- Envia X-meli-session-id ao Mercado Pago.
+- Envia informações adicionais do comprador e do plano.
+- Mantém idempotência, webhook, Pix, débito, crédito e reembolso.
