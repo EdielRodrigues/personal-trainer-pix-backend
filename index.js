@@ -151,6 +151,42 @@ function validateWebhookSignature(req, dataId) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function normalizeReferralCode(value) { return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '').slice(0, 32); }
+function makeReferralCode(uid) { return `PT${String(uid || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 10).toUpperCase()}`; }
+function safeBaseUrl(value) { try { const u = new URL(String(value || '')); return `${u.origin}${u.pathname}`; } catch { return 'https://edielrodrigues.github.io/E-books/'; } }
+async function awardReferralBonus(referredUid, paymentId, now) {
+  const rootRef = db.ref();
+  let awarded = false;
+  await rootRef.transaction(root => {
+    root = root || {};
+    const users = root.users || {};
+    const buyer = users[referredUid];
+    if (!buyer || !buyer.referredByUid || buyer.referralBonusAwarded) return root;
+    const referrerUid = buyer.referredByUid;
+    if (referrerUid === referredUid || !users[referrerUid]) return root;
+    root.referrals = root.referrals || {};
+    root.referrals[referrerUid] = root.referrals[referrerUid] || {};
+    const entry = root.referrals[referrerUid][referredUid] || {};
+    if (entry.bonusAwarded) return root;
+    const referrer = users[referrerUid];
+    let base = Date.now();
+    const currentExpiry = Date.parse(referrer.expiresAt || '');
+    if (Number.isFinite(currentExpiry) && currentExpiry > base) base = currentExpiry;
+    referrer.expiresAt = new Date(base + 86400000).toISOString();
+    referrer.status = 'ativo';
+    referrer.referralDaysEarned = Number(referrer.referralDaysEarned || 0) + 1;
+    referrer.referralApprovedPayments = Number(referrer.referralApprovedPayments || 0) + 1;
+    referrer.updatedAt = now;
+    buyer.referralBonusAwarded = true;
+    buyer.referralBonusPaymentId = paymentId;
+    buyer.referralBonusAwardedAt = now;
+    root.referrals[referrerUid][referredUid] = {...entry,status:'approved',bonusAwarded:true,bonusDays:1,paymentId,approvedAt:now,updatedAt:now};
+    awarded = true;
+    return root;
+  });
+  return awarded;
+}
+
 async function syncPayment(payment, localPayment) {
   const paymentId = String(payment.id);
   const now = new Date().toISOString();
@@ -182,6 +218,7 @@ async function syncPayment(payment, localPayment) {
       lastPaymentId: paymentId,
       updatedAt: now
     });
+    await awardReferralBonus(localPayment.userId, paymentId, now);
   }
 
   await db.ref(`payments/${paymentId}`).update(updates);
@@ -200,6 +237,64 @@ app.get('/health', (req, res) => {
     webhookSecret: Boolean(process.env.MERCADO_PAGO_WEBHOOK_SECRET),
     timestamp: new Date().toISOString()
   });
+});
+
+app.post('/referral/visit', async (req, res) => {
+  try {
+    const code = normalizeReferralCode(req.body?.code);
+    if (!code) return res.status(400).json({ error: 'Código de indicação inválido.' });
+    const ownerUid = (await db.ref(`referralCodes/${code}`).once('value')).val();
+    if (!ownerUid) return res.status(404).json({ error: 'Link de indicação não encontrado.' });
+    await db.ref(`referralStats/${ownerUid}/clicks`).transaction(v => Number(v || 0) + 1);
+    await db.ref(`referralStats/${ownerUid}`).update({ lastClickAt: new Date().toISOString() });
+    res.json({ success: true });
+  } catch (error) { console.error('referral visit:', error); res.status(500).json({ error: 'Não foi possível registrar o acesso.' }); }
+});
+
+app.post('/referral/setup', authenticate, async (req, res) => {
+  try {
+    const userRef = db.ref(`users/${req.user.uid}`);
+    const profile = (await userRef.once('value')).val();
+    if (!profile) return res.status(404).json({ error: 'Cadastro não encontrado.' });
+    let code = normalizeReferralCode(profile.referralCode) || makeReferralCode(req.user.uid);
+    const codeRef = db.ref(`referralCodes/${code}`);
+    const currentOwner = (await codeRef.once('value')).val();
+    if (currentOwner && currentOwner !== req.user.uid) code = `${code}${String(Date.now()).slice(-4)}`;
+    const baseUrl = safeBaseUrl(req.body?.baseUrl);
+    const updates = {};
+    updates[`referralCodes/${code}`] = req.user.uid;
+    updates[`users/${req.user.uid}/referralCode`] = code;
+    updates[`users/${req.user.uid}/referralLink`] = `${baseUrl}?ref=${encodeURIComponent(code)}`;
+    updates[`users/${req.user.uid}/updatedAt`] = new Date().toISOString();
+    const incoming = normalizeReferralCode(req.body?.refCode);
+    if (incoming && !profile.referredByUid) {
+      const referrerUid = (await db.ref(`referralCodes/${incoming}`).once('value')).val();
+      if (referrerUid && referrerUid !== req.user.uid) {
+        const referrer = (await db.ref(`users/${referrerUid}`).once('value')).val() || {};
+        updates[`users/${req.user.uid}/referredByUid`] = referrerUid;
+        updates[`users/${req.user.uid}/referredByCode`] = incoming;
+        updates[`users/${req.user.uid}/referredAt`] = new Date().toISOString();
+        updates[`referrals/${referrerUid}/${req.user.uid}`] = {referredUid:req.user.uid,referredName:profile.name||'',referredEmail:profile.email||req.user.email||'',status:'registered',registeredAt:new Date().toISOString(),bonusAwarded:false};
+        updates[`users/${referrerUid}/referralRegistrations`] = Number(referrer.referralRegistrations||0)+1;
+      }
+    }
+    await db.ref().update(updates);
+    const me = (await userRef.once('value')).val() || {};
+    const referrals = (await db.ref(`referrals/${req.user.uid}`).once('value')).val() || {};
+    const list = Object.values(referrals);
+    const stats = (await db.ref(`referralStats/${req.user.uid}`).once('value')).val() || {};
+    res.json({success:true,referralCode:me.referralCode,referralLink:me.referralLink,clicks:Number(stats.clicks||0),registrations:list.length,approvedPayments:list.filter(x=>x.bonusAwarded).length,daysEarned:Number(me.referralDaysEarned||0),pending:list.filter(x=>!x.bonusAwarded).length});
+  } catch (error) { console.error('referral setup:', error); res.status(500).json({ error: 'Não foi possível configurar a indicação.' }); }
+});
+
+app.get('/referral/me', authenticate, async (req, res) => {
+  try {
+    const me = (await db.ref(`users/${req.user.uid}`).once('value')).val() || {};
+    const referrals = (await db.ref(`referrals/${req.user.uid}`).once('value')).val() || {};
+    const list = Object.values(referrals);
+    const stats = (await db.ref(`referralStats/${req.user.uid}`).once('value')).val() || {};
+    res.json({success:true,referralCode:me.referralCode||'',referralLink:me.referralLink||'',clicks:Number(stats.clicks||0),registrations:list.length,approvedPayments:list.filter(x=>x.bonusAwarded).length,daysEarned:Number(me.referralDaysEarned||0),pending:list.filter(x=>!x.bonusAwarded).length});
+  } catch (error) { res.status(500).json({ error: 'Não foi possível carregar as indicações.' }); }
 });
 
 app.post('/createPix', authenticate, async (req, res) => {

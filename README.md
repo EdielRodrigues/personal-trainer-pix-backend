@@ -49,3 +49,12 @@ https://SEU-SERVICO.onrender.com/webhook
 ```
 
 Selecione notificações de pagamentos.
+
+## Programa de indicação (V8.3)
+
+Rotas adicionadas:
+- `POST /referral/visit`
+- `POST /referral/setup` (autenticada)
+- `GET /referral/me` (autenticada)
+
+Quando o primeiro pagamento do indicado muda para `approved`, o webhook acrescenta automaticamente 1 dia ao vencimento do dono do link. O bônus é registrado uma única vez.
