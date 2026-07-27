@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const admin = require('firebase-admin');
 
 const app = express();
+app.set('trust proxy', true);
 
 app.use(cors({
   origin: true,
@@ -15,17 +16,17 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 function initializeFirebase() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const databaseURL = process.env.FIREBASE_DATABASE_URL;
 
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON não configurado.');
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT não configurado.');
   if (!databaseURL) throw new Error('FIREBASE_DATABASE_URL não configurado.');
 
   let serviceAccount;
   try {
     serviceAccount = JSON.parse(raw);
   } catch {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON inválido. Cole o JSON completo da conta de serviço.');
+    throw new Error('FIREBASE_SERVICE_ACCOUNT inválido. Cole o JSON completo da conta de serviço.');
   }
 
   if (serviceAccount.private_key) {
@@ -43,12 +44,7 @@ function initializeFirebase() {
 initializeFirebase();
 const db = admin.database();
 
-const PLANS = {
-  mensal: { name: 'Plano Mensal', value: 19.90, days: 30 },
-  trimestral: { name: 'Plano Trimestral', value: 49.90, days: 90 },
-  anual: { name: 'Plano Anual', value: 149.90, days: 365 },
-  vitalicio: { name: 'Acesso Vitalício', value: 299.90, days: 36500 }
-};
+const PLANS = { mensal: { name: 'Finance IA Pro Mensal', value: 24.90, days: 30 } };
 
 function mpToken() {
   const token = process.env.MERCADO_PAGO_ACCESS_TOKEN;
@@ -105,7 +101,7 @@ async function authenticateAdmin(req, res, next) {
   return authenticate(req, res, async () => {
     try {
       const profile = (await db.ref(`users/${req.user.uid}`).once('value')).val();
-      if (profile?.role !== 'admin') return res.status(403).json({ error: 'Acesso permitido somente para administrador.' });
+      if (!['admin','owner'].includes(profile?.role)) return res.status(403).json({ error: 'Acesso permitido somente para proprietário ou administrador.' });
       req.adminProfile = profile;
       return next();
     } catch (error) {
@@ -187,51 +183,132 @@ async function awardReferralBonus(referredUid, paymentId, now) {
   return awarded;
 }
 
-async function syncPayment(payment, localPayment) {
-  const paymentId = String(payment.id);
+async function paymentRecordFromMercadoPago(payment) {
+  const paymentId = String(payment.id || '');
+  const metadata = payment.metadata || {};
+  const externalParts = String(payment.external_reference || '').split('|');
+  const userId = String(metadata.firebase_uid || externalParts[0] || '').trim();
+  const planId = String(metadata.plan_id || externalParts[1] || 'mensal').trim();
+  if (!paymentId || !userId) return null;
+
+  const plan = PLANS[planId] || PLANS.mensal;
+  const transaction = payment.point_of_interaction?.transaction_data || {};
   const now = new Date().toISOString();
-  const updates = {
+  const record = {
+    userId,
+    planId,
+    planName: metadata.plan_name || plan.name,
+    amount: Number(payment.transaction_amount || plan.value),
+    paymentMethod: payment.payment_type_id || 'pix',
+    paymentMethodId: payment.payment_method_id || 'pix',
     status: payment.status || 'unknown',
     statusDetail: payment.status_detail || '',
-    updatedAt: now
+    mercadoPagoId: paymentId,
+    qrCode: transaction.qr_code || '',
+    qrCodeBase64: transaction.qr_code_base64 || '',
+    ticketUrl: transaction.ticket_url || '',
+    externalReference: payment.external_reference || `${userId}|${planId}`,
+    createdAt: payment.date_created || now,
+    paymentExpiresAt: payment.date_of_expiration || null,
+    updatedAt: now,
+    recoveredByWebhook: true
   };
+  await db.ref(`payments/${paymentId}`).update(record);
+  return (await db.ref(`payments/${paymentId}`).once('value')).val();
+}
 
-  if (payment.status === 'approved' && localPayment.status !== 'approved') {
-    const plan = PLANS[localPayment.planId];
-    if (!plan) throw new Error(`Plano ${localPayment.planId} não encontrado.`);
+async function syncPayment(payment, suppliedLocalPayment) {
+  const paymentId = String(payment.id);
+  const paymentRef = db.ref(`payments/${paymentId}`);
+  let localPayment = suppliedLocalPayment || (await paymentRef.once('value')).val();
+  if (!localPayment) localPayment = await paymentRecordFromMercadoPago(payment);
+  if (!localPayment?.userId) throw new Error(`Pagamento ${paymentId} sem usuário vinculado.`);
 
-    const userRef = db.ref(`users/${localPayment.userId}`);
-    const userData = (await userRef.once('value')).val() || {};
-    let base = new Date();
-    if (userData.expiresAt) {
-      const current = new Date(userData.expiresAt);
-      if (!Number.isNaN(current.getTime()) && current > base) base = current;
-    }
-    const expiration = new Date(base.getTime() + plan.days * 86400000);
-    updates.approvedAt = now;
+  const now = new Date().toISOString();
+  const remoteStatus = String(payment.status || 'unknown').toLowerCase();
+  const plan = PLANS[localPayment.planId] || PLANS.mensal;
 
-    await userRef.update({
-      status: 'ativo',
-      plan: localPayment.planId,
-      planName: plan.name,
-      expiresAt: expiration.toISOString(),
-      lastPaymentId: paymentId,
-      updatedAt: now
+  // Uma transação na raiz impede que webhooks repetidos acrescentem 30 dias duas vezes.
+  let accessGranted = false;
+  let newExpiration = null;
+  await db.ref().transaction(root => {
+    root = root || {};
+    root.payments = root.payments || {};
+    root.users = root.users || {};
+    const stored = root.payments[paymentId] || localPayment || {};
+    const user = root.users[localPayment.userId] || {};
+    const existingUserExpiry = Date.parse(user.subscriptionUntil || user.expiresAt || '');
+    const wasApproved = Boolean(stored.accessGrantedAt) || (String(user.lastPaymentId || '') === paymentId && Number.isFinite(existingUserExpiry));
+
+    Object.assign(stored, {
+      status: remoteStatus,
+      statusDetail: payment.status_detail || '',
+      mercadoPagoId: paymentId,
+      updatedAt: now,
+      lastWebhookAt: now,
+      lastMercadoPagoStatusAt: payment.date_last_updated || now
     });
+
+    if (remoteStatus === 'approved') {
+      stored.approvedAt = stored.approvedAt || payment.date_approved || now;
+      stored.paidAt = stored.paidAt || payment.date_approved || now;
+      if (!wasApproved) {
+        let baseMs = Date.now();
+        const currentExpiry = Date.parse(user.subscriptionUntil || user.expiresAt || '');
+        if (Number.isFinite(currentExpiry) && currentExpiry > baseMs) baseMs = currentExpiry;
+        newExpiration = new Date(baseMs + plan.days * 86400000).toISOString();
+        Object.assign(user, {
+          status: 'ativo',
+          plan: 'premium',
+          planId: localPayment.planId || 'mensal',
+          planName: plan.name,
+          subscriptionStatus: 'active',
+          subscriptionStartedAt: user.subscriptionStartedAt || payment.date_approved || now,
+          subscriptionUntil: newExpiration,
+          expiresAt: newExpiration,
+          lastPaymentId: paymentId,
+          lastPaymentAmount: Number(payment.transaction_amount || localPayment.amount || plan.value),
+          lastPaymentApprovedAt: payment.date_approved || now,
+          paidAt: payment.date_approved || now,
+          updatedAt: now
+        });
+        stored.accessGrantedAt = now;
+        stored.subscriptionUntil = newExpiration;
+        stored.daysGranted = plan.days;
+        accessGranted = true;
+      }
+    }
+
+    root.payments[paymentId] = stored;
+    root.users[localPayment.userId] = user;
+    root.paymentEvents = root.paymentEvents || {};
+    root.paymentEvents[paymentId] = root.paymentEvents[paymentId] || {};
+    const eventKey = String(Date.now()) + '_' + crypto.randomBytes(3).toString('hex');
+    root.paymentEvents[paymentId][eventKey] = {
+      status: remoteStatus,
+      statusDetail: payment.status_detail || '',
+      receivedAt: now,
+      source: 'mercado_pago'
+    };
+    return root;
+  });
+
+  if (remoteStatus === 'approved' && accessGranted) {
     await awardReferralBonus(localPayment.userId, paymentId, now);
   }
-
-  await db.ref(`payments/${paymentId}`).update(updates);
-  return updates;
+  const updated = (await paymentRef.once('value')).val() || {};
+  return { ...updated, accessGranted, subscriptionUntil: updated.subscriptionUntil || newExpiration };
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Personal Trainer Pix', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '4.5.0', pixFix: 'webhook-idempotente-app-fechado', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
+    version: '4.5.0',
+    pixFix: 'webhook-idempotente-app-fechado',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
     webhookSecret: Boolean(process.env.MERCADO_PAGO_WEBHOOK_SECRET),
@@ -320,7 +397,7 @@ app.post('/createPix', authenticate, async (req, res) => {
       headers: { 'X-Idempotency-Key': crypto.randomUUID() },
       body: JSON.stringify({
         transaction_amount: Number(plan.value),
-        description: `Personal Trainer Avançado Pro - ${plan.name}`,
+        description: `Finance IA Pro - ${plan.name}`,
         payment_method_id: 'pix',
         date_of_expiration: expiresAt,
         external_reference: externalReference,
@@ -330,6 +407,7 @@ app.post('/createPix', authenticate, async (req, res) => {
           last_name: lastName,
           identification: { type: 'CPF', number: cpf }
         },
+        notification_url: String(process.env.MERCADO_PAGO_WEBHOOK_URL || `${req.protocol}://${req.get('host')}/webhook`),
         metadata: {
           firebase_uid: req.user.uid,
           plan_id: planId,
@@ -351,7 +429,6 @@ app.post('/createPix', authenticate, async (req, res) => {
       paymentMethodId: 'pix',
       status: payment.status || 'pending',
       statusDetail: payment.status_detail || '',
-      deviceIdSent: Boolean(deviceSessionId),
       mercadoPagoId: String(payment.id),
       qrCode: transaction.qr_code || '',
       qrCodeBase64: transaction.qr_code_base64 || '',
@@ -402,7 +479,7 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
       body: JSON.stringify({
         transaction_amount: Number(plan.value),
         token,
-        description: `Personal Trainer Avançado Pro - ${plan.name}`,
+        description: `Finance IA Pro - ${plan.name}`,
         installments,
         payment_method_id: paymentMethodId,
         ...(issuerId ? { issuer_id: issuerId } : {}),
@@ -417,7 +494,7 @@ app.post('/createCardPayment', authenticate, async (req, res) => {
         additional_info: {
           items: [{
             id: planId,
-            title: `Personal Trainer Avançado Pro - ${plan.name}`,
+            title: `Finance IA Pro - ${plan.name}`,
             description: `${plan.days} dias de acesso ao aplicativo`,
             category_id: 'services',
             quantity: 1,
@@ -486,20 +563,65 @@ app.get('/latestPayment', authenticate, async (req, res) => {
     const snapshot = await db.ref('payments')
       .orderByChild('userId')
       .equalTo(req.user.uid)
-      .limitToLast(1)
       .once('value');
 
     const all = snapshot.val() || {};
-    const ids = Object.keys(all);
-    if (!ids.length) return res.json({ success: true, payment: null });
-    const id = ids[0];
-    res.json({ success: true, payment: { id, ...all[id] } });
+    const entries = Object.entries(all).sort((a,b) =>
+      Date.parse(b[1]?.createdAt || b[1]?.updatedAt || 0) - Date.parse(a[1]?.createdAt || a[1]?.updatedAt || 0)
+    );
+    if (!entries.length) return res.json({ success: true, payment: null });
+
+    // Confere no Mercado Pago as cobranças ainda não finalizadas. Isso resolve
+    // pagamentos feitos com o app aberto, em segundo plano ou fechado.
+    for (const [id, local] of entries.slice(0, 10)) {
+      if (['approved','rejected','cancelled','refunded','charged_back'].includes(String(local.status || '').toLowerCase())) continue;
+      try {
+        const remote = await mpRequest(`/v1/payments/${encodeURIComponent(id)}`);
+        await syncPayment(remote, local);
+      } catch (syncError) {
+        console.error(`Falha ao reconciliar pagamento ${id}:`, syncError.message);
+      }
+    }
+
+    const refreshed = await db.ref('payments')
+      .orderByChild('userId')
+      .equalTo(req.user.uid)
+      .once('value');
+    const refreshedEntries = Object.entries(refreshed.val() || {}).sort((a,b) =>
+      Date.parse(b[1]?.createdAt || b[1]?.updatedAt || 0) - Date.parse(a[1]?.createdAt || a[1]?.updatedAt || 0)
+    );
+    const [id, payment] = refreshedEntries[0] || [];
+    res.json({ success: true, payment: id ? { id, ...payment } : null });
   } catch (error) {
     console.error('latestPayment:', error);
     res.status(500).json({ error: error.message || 'Não foi possível buscar o pagamento.' });
   }
 });
 
+
+
+app.post('/reconcilePendingPayments', authenticateAdmin, async (req, res) => {
+  try {
+    const snap = await db.ref('payments').once('value');
+    const all = snap.val() || {};
+    let checked = 0, approved = 0, failed = 0;
+    for (const [id, local] of Object.entries(all)) {
+      if (!['pending','in_process','authorized','unknown'].includes(String(local.status || '').toLowerCase())) continue;
+      checked++;
+      try {
+        const remote = await mpRequest(`/v1/payments/${encodeURIComponent(id)}`);
+        const result = await syncPayment(remote, local);
+        if (String(remote.status).toLowerCase() === 'approved' && result.accessGrantedAt) approved++;
+      } catch (error) {
+        failed++;
+        console.error(`Reconciliação ${id}:`, error.message);
+      }
+    }
+    res.json({ success:true, checked, approved, failed, at:new Date().toISOString() });
+  } catch (error) {
+    res.status(500).json({ error:error.message || 'Falha na reconciliação.' });
+  }
+});
 
 app.post('/admin/cancelPayment', authenticateAdmin, async (req, res) => {
   try {
@@ -579,25 +701,52 @@ app.post('/admin/cancelPayment', authenticateAdmin, async (req, res) => {
   }
 });
 
-app.post('/webhook', async (req, res) => {
+async function processMercadoPagoWebhook(req, res) {
   const paymentId = paymentIdFromRequest(req);
   try {
-    if (!paymentId) return res.sendStatus(200);
-    if (!validateWebhookSignature(req, paymentId)) return res.sendStatus(401);
-
-    res.sendStatus(200);
+    if (!paymentId) return res.status(200).json({ received: true, ignored: 'sem_payment_id' });
+    if (!validateWebhookSignature(req, paymentId)) return res.status(401).json({ received: false, error: 'assinatura_invalida' });
 
     const payment = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
     const local = (await db.ref(`payments/${paymentId}`).once('value')).val();
-    if (!local) return console.warn(`Pagamento ${paymentId} não encontrado no Firebase.`);
-    await syncPayment(payment, local);
-    console.log(`Pagamento ${paymentId} sincronizado: ${payment.status}`);
+    const result = await syncPayment(payment, local);
+    console.log(`Pagamento ${paymentId} sincronizado: ${payment.status}; acesso=${Boolean(result.accessGrantedAt)}`);
+    return res.status(200).json({ received: true, paymentId, status: payment.status });
   } catch (error) {
     console.error('webhook:', error);
+    // Retorna erro para o Mercado Pago tentar entregar novamente.
+    return res.status(500).json({ received: false, error: 'falha_ao_processar' });
   }
-});
+}
+
+app.post('/webhook', processMercadoPagoWebhook);
+app.get('/webhook', processMercadoPagoWebhook);
 
 app.use((req, res) => res.status(404).json({ error: 'Rota não encontrada.' }));
+
+
+async function reconcileRecentPendingPayments() {
+  try {
+    const snap = await db.ref('payments').once('value');
+    const all = snap.val() || {};
+    const cutoff = Date.now() - 48 * 60 * 60 * 1000;
+    for (const [id, local] of Object.entries(all)) {
+      const status = String(local.status || '').toLowerCase();
+      const created = Date.parse(local.createdAt || local.updatedAt || 0);
+      if (!['pending','in_process','authorized','unknown'].includes(status) || (created && created < cutoff)) continue;
+      try {
+        const remote = await mpRequest(`/v1/payments/${encodeURIComponent(id)}`);
+        await syncPayment(remote, local);
+      } catch (error) {
+        console.error(`Reconciliação automática ${id}:`, error.message);
+      }
+    }
+  } catch (error) {
+    console.error('Reconciliação automática:', error.message);
+  }
+}
+setInterval(reconcileRecentPendingPayments, 2 * 60 * 1000).unref();
+setTimeout(reconcileRecentPendingPayments, 15000).unref();
 
 const PORT = Number(process.env.PORT || 10000);
 app.listen(PORT, '0.0.0.0', () => {

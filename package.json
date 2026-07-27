@@ -1,6 +1,6 @@
 {
-  "name": "personal-trainer-pix-backend",
-  "version": "1.0.0",
+  "name": "finance-ia-pro-pix-backend",
+  "version": "3.0.0",
   "private": true,
   "main": "index.js",
   "scripts": {
