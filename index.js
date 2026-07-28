@@ -623,58 +623,93 @@ app.post('/reconcilePendingPayments', authenticateAdmin, async (req, res) => {
   }
 });
 
-app.post('/admin/deleteUser', authenticateAdmin, async (req, res) => {
+
+async function deleteUserCompletely(targetUid) {
+  const targetProfile = (await db.ref(`users/${targetUid}`).once('value')).val() || {};
+  const rootSnap = await db.ref().once('value');
+  const root = rootSnap.val() || {};
+  const updates = {
+    [`users/${targetUid}`]: null,
+    [`finance/${targetUid}`]: null,
+    [`userNotifications/${targetUid}`]: null,
+    [`deviceSessions/${targetUid}`]: null,
+    [`referrals/${targetUid}`]: null
+  };
+
+  const cpf = onlyNumbers(targetProfile.cpf);
+  const phone = onlyNumbers(targetProfile.phone);
+  if (cpf) updates[`cpfIndex/${cpf}`] = null;
+  if (phone) updates[`phoneIndex/${phone}`] = null;
+
+  for (const [key, uid] of Object.entries(root.cpfIndex || {})) {
+    if (String(uid || '') === targetUid) updates[`cpfIndex/${key}`] = null;
+  }
+  for (const [key, uid] of Object.entries(root.phoneIndex || {})) {
+    if (String(uid || '') === targetUid) updates[`phoneIndex/${key}`] = null;
+  }
+  for (const [paymentId, payment] of Object.entries(root.payments || {})) {
+    if (String(payment?.userId || '') === targetUid) updates[`payments/${paymentId}`] = null;
+  }
+  for (const [ownerUid, referrals] of Object.entries(root.referrals || {})) {
+    if (referrals && Object.prototype.hasOwnProperty.call(referrals, targetUid)) {
+      updates[`referrals/${ownerUid}/${targetUid}`] = null;
+    }
+  }
+
+  await db.ref().update(updates);
+
+  let authenticationDeleted = false;
+  try {
+    await admin.auth().deleteUser(targetUid);
+    authenticationDeleted = true;
+  } catch (error) {
+    if (error.code !== 'auth/user-not-found') throw error;
+  }
+
+  return {
+    uid: targetUid,
+    email: targetProfile.email || '',
+    cpfRemoved: Boolean(cpf),
+    phoneRemoved: Boolean(phone),
+    authenticationDeleted
+  };
+}
+
+async function adminDeleteUserHandler(req, res) {
   try {
     const targetUid = String(req.body?.uid || '').trim();
     if (!targetUid) return res.status(400).json({ error: 'UID do usuário não informado.' });
-    if (targetUid === req.user.uid) return res.status(400).json({ error: 'Você não pode excluir a própria conta administrativa.' });
+    if (targetUid === req.user.uid) return res.status(400).json({ error: 'Use a opção Excluir minha conta para apagar sua própria conta.' });
 
     const targetProfile = (await db.ref(`users/${targetUid}`).once('value')).val() || {};
     if (['owner', 'admin'].includes(String(targetProfile.role || '').toLowerCase())) {
       return res.status(403).json({ error: 'Contas administrativas não podem ser excluídas por esta tela.' });
     }
 
-    // Primeiro remove o login do Firebase Authentication. Se a conta já não existir,
-    // continua a limpeza para apagar qualquer dado órfão no Realtime Database.
-    let authenticationDeleted = false;
-    try {
-      await admin.auth().deleteUser(targetUid);
-      authenticationDeleted = true;
-    } catch (error) {
-      if (error.code !== 'auth/user-not-found') throw error;
-    }
-
-    const rootSnap = await db.ref().once('value');
-    const root = rootSnap.val() || {};
-    const updates = {
-      [`users/${targetUid}`]: null,
-      [`finance/${targetUid}`]: null,
-      [`userNotifications/${targetUid}`]: null,
-      [`deviceSessions/${targetUid}`]: null,
-      [`referrals/${targetUid}`]: null
-    };
-
-    // Exclui pagamentos e outros registros diretamente vinculados ao cliente.
-    for (const [paymentId, payment] of Object.entries(root.payments || {})) {
-      if (String(payment?.userId || '') === targetUid) updates[`payments/${paymentId}`] = null;
-    }
-    for (const [ownerUid, referrals] of Object.entries(root.referrals || {})) {
-      if (referrals && Object.prototype.hasOwnProperty.call(referrals, targetUid)) {
-        updates[`referrals/${ownerUid}/${targetUid}`] = null;
-      }
-    }
-
-    await db.ref().update(updates);
-    return res.json({
-      success: true,
-      uid: targetUid,
-      email: targetProfile.email || '',
-      cpfRemoved: Boolean(targetProfile.cpf),
-      authenticationDeleted
-    });
+    const result = await deleteUserCompletely(targetUid);
+    return res.json({ success: true, ...result });
   } catch (error) {
     console.error('admin/deleteUser:', error);
     return res.status(500).json({ error: error.message || 'Não foi possível excluir completamente o usuário.' });
+  }
+}
+
+// Rotas equivalentes para evitar erro de rota em versões antigas do aplicativo.
+app.post('/admin/deleteUser', authenticateAdmin, adminDeleteUserHandler);
+app.post('/admin/delete-user', authenticateAdmin, adminDeleteUserHandler);
+app.post('/admin/users/delete', authenticateAdmin, adminDeleteUserHandler);
+
+app.post('/account/delete', authenticate, async (req, res) => {
+  try {
+    const profile = (await db.ref(`users/${req.user.uid}`).once('value')).val() || {};
+    if (['owner', 'admin'].includes(String(profile.role || '').toLowerCase())) {
+      return res.status(403).json({ error: 'A conta do proprietário ou administrador não pode ser excluída por esta opção.' });
+    }
+    const result = await deleteUserCompletely(req.user.uid);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('account/delete:', error);
+    return res.status(500).json({ error: error.message || 'Não foi possível excluir completamente sua conta.' });
   }
 });
 
