@@ -301,13 +301,13 @@ async function syncPayment(payment, suppliedLocalPayment) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Finance IA Pro Pix', version: '4.6.0', pixFix: 'webhook-idempotente-app-fechado', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '4.7.0', pixFix: 'webhook-idempotente-app-fechado', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    version: '4.6.0',
+    version: '4.7.0',
     pixFix: 'webhook-idempotente-app-fechado',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
@@ -639,11 +639,33 @@ async function deleteUserCompletely(targetUid) {
 
   const cpf = onlyNumbers(targetProfile.cpf);
   const phone = onlyNumbers(targetProfile.phone);
-  if (cpf) updates[`cpfIndex/${cpf}`] = null;
+  const email = String(targetProfile.email || '').trim().toLowerCase();
+
+  // Remove o CPF de todos os índices conhecidos, com ou sem pontuação.
+  const cpfFormatted = cpf.length === 11
+    ? `${cpf.slice(0,3)}.${cpf.slice(3,6)}.${cpf.slice(6,9)}-${cpf.slice(9)}`
+    : '';
+  const cpfIndexRoots = ['cpfIndex', 'cpfs', 'cpf', 'usersByCpf', 'usuariosPorCpf', 'cpfUsers', 'documentIndex'];
+  for (const indexRoot of cpfIndexRoots) {
+    if (cpf) updates[`${indexRoot}/${cpf}`] = null;
+    if (cpfFormatted) updates[`${indexRoot}/${cpfFormatted}`] = null;
+    for (const [key, value] of Object.entries(root[indexRoot] || {})) {
+      const normalizedKey = onlyNumbers(key);
+      const linkedUid = typeof value === 'object' && value ? String(value.uid || value.userId || value.id || '') : String(value || '');
+      const linkedCpf = typeof value === 'object' && value ? onlyNumbers(value.cpf || value.document || value.documentNumber) : '';
+      const linkedEmail = typeof value === 'object' && value ? String(value.email || '').trim().toLowerCase() : '';
+      if (linkedUid === targetUid || (cpf && (normalizedKey === cpf || linkedCpf === cpf)) || (email && linkedEmail === email)) {
+        updates[`${indexRoot}/${key}`] = null;
+      }
+    }
+  }
+
   if (phone) updates[`phoneIndex/${phone}`] = null;
 
+  // Compatibilidade com o índice principal antigo.
   for (const [key, uid] of Object.entries(root.cpfIndex || {})) {
-    if (String(uid || '') === targetUid) updates[`cpfIndex/${key}`] = null;
+    const linkedUid = typeof uid === 'object' && uid ? String(uid.uid || uid.userId || uid.id || '') : String(uid || '');
+    if (linkedUid === targetUid || (cpf && onlyNumbers(key) === cpf)) updates[`cpfIndex/${key}`] = null;
   }
   for (const [key, uid] of Object.entries(root.phoneIndex || {})) {
     if (String(uid || '') === targetUid) updates[`phoneIndex/${key}`] = null;
@@ -671,6 +693,7 @@ async function deleteUserCompletely(targetUid) {
     uid: targetUid,
     email: targetProfile.email || '',
     cpfRemoved: Boolean(cpf),
+    cpfValueRemoved: cpf || '',
     phoneRemoved: Boolean(phone),
     authenticationDeleted
   };
