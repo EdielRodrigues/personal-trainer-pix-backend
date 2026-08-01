@@ -18,17 +18,17 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 function initializeFirebase() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   const databaseURL = process.env.FIREBASE_DATABASE_URL;
 
-  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT não configurado.');
+  if (!raw) throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON não configurado.');
   if (!databaseURL) throw new Error('FIREBASE_DATABASE_URL não configurado.');
 
   let serviceAccount;
   try {
     serviceAccount = JSON.parse(raw);
   } catch {
-    throw new Error('FIREBASE_SERVICE_ACCOUNT inválido. Cole o JSON completo da conta de serviço.');
+    throw new Error('FIREBASE_SERVICE_ACCOUNT_JSON inválido. Cole o JSON completo da conta de serviço.');
   }
 
   if (serviceAccount.private_key) {
@@ -304,17 +304,20 @@ async function syncPayment(payment, suppliedLocalPayment) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.1.0', pixFix: 'v8.1-pix-persistente-exclusao-uid', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.1.1', pixFix: 'v8.1.1-render-env-exato', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    version: '5.1.0',
-    pixFix: 'v8.1-pix-persistente-exclusao-uid',
+    version: '5.1.1',
+    pixFix: 'v8.1.1-render-env-exato',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
     webhookSecret: Boolean(process.env.MERCADO_PAGO_WEBHOOK_SECRET),
+    webhookUrl: Boolean(process.env.MERCADO_PAGO_WEBHOOK_URL),
+    firebaseServiceAccountJson: Boolean(process.env.FIREBASE_SERVICE_ACCOUNT_JSON),
+    firebaseDatabaseUrl: Boolean(process.env.FIREBASE_DATABASE_URL),
     deleteRoutes: true,
     timestamp: new Date().toISOString()
   });
