@@ -3,7 +3,9 @@
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
-const admin = require('firebase-admin');
+const { initializeApp, cert, getApps } = require('firebase-admin/app');
+const { getDatabase } = require('firebase-admin/database');
+const { getAuth } = require('firebase-admin/auth');
 
 const app = express();
 app.set('trust proxy', true);
@@ -33,16 +35,17 @@ function initializeFirebase() {
     serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
   }
 
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
+  if (!getApps().length) {
+    initializeApp({
+      credential: cert(serviceAccount),
       databaseURL
     });
   }
 }
 
 initializeFirebase();
-const db = admin.database();
+const db = getDatabase();
+const auth = getAuth();
 
 const PLANS = { mensal: { name: 'Finance IA Pro Mensal', value: 24.90, days: 30 } };
 
@@ -89,7 +92,7 @@ async function authenticate(req, res, next) {
     if (!header.startsWith('Bearer ')) {
       return res.status(401).json({ error: 'Token não informado.' });
     }
-    req.user = await admin.auth().verifyIdToken(header.slice(7).trim());
+    req.user = await auth.verifyIdToken(header.slice(7).trim());
     return next();
   } catch (error) {
     console.error('Autenticação:', error.message);
@@ -631,7 +634,7 @@ async function deleteUserCompletely(targetUid, context = {}) {
   if (!targetUid) throw new Error('UID do usuário não informado.');
 
   let authRecord = null;
-  try { authRecord = await admin.auth().getUser(targetUid); }
+  try { authRecord = await auth.getUser(targetUid); }
   catch (error) { if (error.code !== 'auth/user-not-found') throw error; }
 
   const targetProfile = (await db.ref(`users/${targetUid}`).once('value')).val() || {};
@@ -738,7 +741,7 @@ async function deleteUserCompletely(targetUid, context = {}) {
 
   let authenticationDeleted = false;
   try {
-    await admin.auth().deleteUser(targetUid);
+    await auth.deleteUser(targetUid);
     authenticationDeleted = true;
   } catch (error) {
     if (error.code !== 'auth/user-not-found') throw error;

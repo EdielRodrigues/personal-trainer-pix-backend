@@ -1,6 +1,6 @@
 {
   "name": "finance-ia-pro-pix-backend",
-  "version": "5.0.0",
+  "version": "5.0.1",
   "private": true,
   "main": "index.js",
   "scripts": {
@@ -12,6 +12,6 @@
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.2",
-    "firebase-admin": "^13.0.0"
+    "firebase-admin": "14.2.0"
   }
 }

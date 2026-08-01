@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: personal-trainer-pix
+    name: finance-ia-pro-pix-backend
     runtime: node
     plan: free
     buildCommand: npm install
