@@ -304,13 +304,13 @@ async function syncPayment(payment, suppliedLocalPayment) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.1.1', pixFix: 'v8.1.1-render-env-exato', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.1.2', pixFix: 'v8.1.1-render-env-exato', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    version: '5.1.1',
+    version: '5.1.2',
     pixFix: 'v8.1.1-render-env-exato',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
