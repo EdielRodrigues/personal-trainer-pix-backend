@@ -301,14 +301,14 @@ async function syncPayment(payment, suppliedLocalPayment) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Finance IA Pro Pix', version: '4.7.0', pixFix: 'webhook-idempotente-app-fechado', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.0.0', pixFix: 'v8-webhook-e-exclusao-unificada', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    version: '4.7.0',
-    pixFix: 'webhook-idempotente-app-fechado',
+    version: '5.0.0',
+    pixFix: 'v8-webhook-e-exclusao-unificada',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
     webhookSecret: Boolean(process.env.MERCADO_PAGO_WEBHOOK_SECRET),
@@ -625,59 +625,114 @@ app.post('/reconcilePendingPayments', authenticateAdmin, async (req, res) => {
 });
 
 
-async function deleteUserCompletely(targetUid) {
+async function deleteUserCompletely(targetUid, context = {}) {
+  const actorUid = String(context.actorUid || targetUid || '').trim();
+  const source = String(context.source || 'self');
+  if (!targetUid) throw new Error('UID do usuário não informado.');
+
+  let authRecord = null;
+  try { authRecord = await admin.auth().getUser(targetUid); }
+  catch (error) { if (error.code !== 'auth/user-not-found') throw error; }
+
   const targetProfile = (await db.ref(`users/${targetUid}`).once('value')).val() || {};
   const rootSnap = await db.ref().once('value');
   const root = rootSnap.val() || {};
-  const updates = {
-    [`users/${targetUid}`]: null,
-    [`finance/${targetUid}`]: null,
-    [`userNotifications/${targetUid}`]: null,
-    [`deviceSessions/${targetUid}`]: null,
-    [`referrals/${targetUid}`]: null
-  };
+  const email = String(targetProfile.email || authRecord?.email || '').trim().toLowerCase();
+  const phone = onlyNumbers(targetProfile.phone || authRecord?.phoneNumber || '');
 
-  const cpf = onlyNumbers(targetProfile.cpf);
-  const phone = onlyNumbers(targetProfile.phone);
-  const email = String(targetProfile.email || '').trim().toLowerCase();
+  // Descobre todos os CPFs associados ao UID, mesmo quando o perfil antigo não possui o campo cpf.
+  const cpfCandidates = new Set();
+  const addCpf = value => { const c = onlyNumbers(value); if (c.length === 11) cpfCandidates.add(c); };
+  addCpf(targetProfile.cpf);
+  addCpf(targetProfile.document);
+  addCpf(targetProfile.documentNumber);
 
-  // Remove o CPF de todos os índices conhecidos, com ou sem pontuação.
-  const cpfFormatted = cpf.length === 11
-    ? `${cpf.slice(0,3)}.${cpf.slice(3,6)}.${cpf.slice(6,9)}-${cpf.slice(9)}`
-    : '';
   const cpfIndexRoots = ['cpfIndex', 'cpfs', 'cpf', 'usersByCpf', 'usuariosPorCpf', 'cpfUsers', 'documentIndex'];
   for (const indexRoot of cpfIndexRoots) {
-    if (cpf) updates[`${indexRoot}/${cpf}`] = null;
-    if (cpfFormatted) updates[`${indexRoot}/${cpfFormatted}`] = null;
     for (const [key, value] of Object.entries(root[indexRoot] || {})) {
-      const normalizedKey = onlyNumbers(key);
-      const linkedUid = typeof value === 'object' && value ? String(value.uid || value.userId || value.id || '') : String(value || '');
-      const linkedCpf = typeof value === 'object' && value ? onlyNumbers(value.cpf || value.document || value.documentNumber) : '';
+      const linkedUid = typeof value === 'object' && value
+        ? String(value.uid || value.userId || value.id || value.value || '')
+        : String(value || '');
       const linkedEmail = typeof value === 'object' && value ? String(value.email || '').trim().toLowerCase() : '';
-      if (linkedUid === targetUid || (cpf && (normalizedKey === cpf || linkedCpf === cpf)) || (email && linkedEmail === email)) {
+      if (linkedUid === targetUid || (email && linkedEmail === email)) {
+        addCpf(key);
+        if (value && typeof value === 'object') {
+          addCpf(value.cpf); addCpf(value.document); addCpf(value.documentNumber);
+        }
+      }
+    }
+  }
+
+  const updates = {};
+  const uidRoots = [
+    'users','finance','userNotifications','deviceSessions','sessions','userSessions',
+    'referrals','referralStats','referralCodesByUser','subscriptions','userSubscriptions',
+    'profiles','userProfiles','preferences','userPreferences','alerts','userAlerts',
+    'pushTokens','fcmTokens','devices','userDevices','activity','userActivity'
+  ];
+  uidRoots.forEach(path => { updates[`${path}/${targetUid}`] = null; });
+
+  // Remove índices de CPF em todos os formatos e qualquer entrada ligada ao UID/e-mail.
+  for (const indexRoot of cpfIndexRoots) {
+    for (const cpf of cpfCandidates) {
+      const formatted = `${cpf.slice(0,3)}.${cpf.slice(3,6)}.${cpf.slice(6,9)}-${cpf.slice(9)}`;
+      updates[`${indexRoot}/${cpf}`] = null;
+      updates[`${indexRoot}/${formatted}`] = null;
+    }
+    for (const [key, value] of Object.entries(root[indexRoot] || {})) {
+      const linkedUid = typeof value === 'object' && value
+        ? String(value.uid || value.userId || value.id || value.value || '')
+        : String(value || '');
+      const linkedEmail = typeof value === 'object' && value ? String(value.email || '').trim().toLowerCase() : '';
+      const linkedCpf = typeof value === 'object' && value ? onlyNumbers(value.cpf || value.document || value.documentNumber) : '';
+      if (linkedUid === targetUid || (email && linkedEmail === email) || (linkedCpf && cpfCandidates.has(linkedCpf)) || cpfCandidates.has(onlyNumbers(key))) {
         updates[`${indexRoot}/${key}`] = null;
       }
     }
   }
 
-  if (phone) updates[`phoneIndex/${phone}`] = null;
-
-  // Compatibilidade com o índice principal antigo.
-  for (const [key, uid] of Object.entries(root.cpfIndex || {})) {
-    const linkedUid = typeof uid === 'object' && uid ? String(uid.uid || uid.userId || uid.id || '') : String(uid || '');
-    if (linkedUid === targetUid || (cpf && onlyNumbers(key) === cpf)) updates[`cpfIndex/${key}`] = null;
-  }
-  for (const [key, uid] of Object.entries(root.phoneIndex || {})) {
-    if (String(uid || '') === targetUid) updates[`phoneIndex/${key}`] = null;
-  }
-  for (const [paymentId, payment] of Object.entries(root.payments || {})) {
-    if (String(payment?.userId || '') === targetUid) updates[`payments/${paymentId}`] = null;
-  }
-  for (const [ownerUid, referrals] of Object.entries(root.referrals || {})) {
-    if (referrals && Object.prototype.hasOwnProperty.call(referrals, targetUid)) {
-      updates[`referrals/${ownerUid}/${targetUid}`] = null;
+  const simpleIndexes = ['phoneIndex','emailIndex','usersByEmail','usuariosPorEmail','userEmailIndex'];
+  for (const indexRoot of simpleIndexes) {
+    for (const [key, value] of Object.entries(root[indexRoot] || {})) {
+      const linkedUid = typeof value === 'object' && value
+        ? String(value.uid || value.userId || value.id || value.value || '')
+        : String(value || '');
+      const linkedEmail = typeof value === 'object' && value ? String(value.email || '').trim().toLowerCase() : '';
+      if (linkedUid === targetUid || (email && (linkedEmail === email || String(key).trim().toLowerCase() === email)) || (phone && onlyNumbers(key) === phone)) {
+        updates[`${indexRoot}/${key}`] = null;
+      }
     }
   }
+  if (phone) updates[`phoneIndex/${phone}`] = null;
+  if (email) {
+    updates[`emailIndex/${email.replace(/[.#$\[\]/]/g, '_')}`] = null;
+    updates[`usersByEmail/${email.replace(/[.#$\[\]/]/g, '_')}`] = null;
+  }
+
+  // Remove pagamentos, eventos e referências associados ao usuário.
+  const paymentIds = [];
+  for (const [paymentId, payment] of Object.entries(root.payments || {})) {
+    if (String(payment?.userId || payment?.uid || '') === targetUid || (email && String(payment?.payerEmail || payment?.email || '').toLowerCase() === email)) {
+      paymentIds.push(paymentId);
+      updates[`payments/${paymentId}`] = null;
+      updates[`paymentEvents/${paymentId}`] = null;
+    }
+  }
+  for (const [ownerUid, referrals] of Object.entries(root.referrals || {})) {
+    if (referrals && Object.prototype.hasOwnProperty.call(referrals, targetUid)) updates[`referrals/${ownerUid}/${targetUid}`] = null;
+  }
+
+  // Guarda somente auditoria técnica, sem CPF, telefone ou e-mail em texto puro.
+  const auditKey = db.ref('deletionAudits').push().key;
+  updates[`deletionAudits/${auditKey}`] = {
+    targetUid,
+    actorUid,
+    source,
+    cpfCount: cpfCandidates.size,
+    paymentCount: paymentIds.length,
+    authenticationExisted: Boolean(authRecord),
+    createdAt: new Date().toISOString()
+  };
 
   await db.ref().update(updates);
 
@@ -691,9 +746,9 @@ async function deleteUserCompletely(targetUid) {
 
   return {
     uid: targetUid,
-    email: targetProfile.email || '',
-    cpfRemoved: Boolean(cpf),
-    cpfValueRemoved: cpf || '',
+    cpfRemoved: cpfCandidates.size > 0,
+    cpfEntriesRemoved: cpfCandidates.size,
+    paymentsRemoved: paymentIds.length,
     phoneRemoved: Boolean(phone),
     authenticationDeleted
   };
@@ -701,32 +756,27 @@ async function deleteUserCompletely(targetUid) {
 
 async function adminDeleteUserHandler(req, res) {
   try {
-    const targetUid = String(req.body?.uid || '').trim();
+    const targetUid = String(req.body?.uid || req.body?.targetUid || req.body?.userId || req.query?.uid || '').trim();
     if (!targetUid) return res.status(400).json({ error: 'UID do usuário não informado.' });
     if (targetUid === req.user.uid) return res.status(400).json({ error: 'Use a opção Excluir minha conta para apagar sua própria conta.' });
 
     const targetProfile = (await db.ref(`users/${targetUid}`).once('value')).val() || {};
-    if (['owner', 'admin'].includes(String(targetProfile.role || '').toLowerCase())) {
+    const targetEmail = String(targetProfile.email || '').toLowerCase();
+    if (['owner', 'admin'].includes(String(targetProfile.role || '').toLowerCase()) || OWNER_EMAILS.includes(targetEmail)) {
       return res.status(403).json({ error: 'Contas administrativas não podem ser excluídas por esta tela.' });
     }
 
-    const result = await deleteUserCompletely(targetUid);
-    return res.json({ success: true, ...result });
+    const result = await deleteUserCompletely(targetUid, { actorUid: req.user.uid, source: 'admin' });
+    return res.json({ success: true, message: 'Conta e todos os dados foram excluídos.', ...result });
   } catch (error) {
     console.error('admin/deleteUser:', error);
     return res.status(500).json({ error: error.message || 'Não foi possível excluir completamente o usuário.' });
   }
 }
 
-// Rotas equivalentes para evitar erro de rota em versões antigas do aplicativo.
 const adminDeleteRoutes = [
-  '/admin/deleteUser',
-  '/admin/delete-user',
-  '/admin/users/delete',
-  '/api/admin/deleteUser',
-  '/api/admin/delete-user',
-  '/deleteUser',
-  '/delete-user-complete'
+  '/admin/deleteUser','/admin/delete-user','/admin/users/delete','/admin/users/delete-complete',
+  '/api/admin/deleteUser','/api/admin/delete-user','/api/admin/users/delete','/deleteUser','/delete-user-complete'
 ];
 for (const route of adminDeleteRoutes) {
   app.post(route, authenticateAdmin, adminDeleteUserHandler);
@@ -736,11 +786,12 @@ for (const route of adminDeleteRoutes) {
 async function selfDeleteUserHandler(req, res) {
   try {
     const profile = (await db.ref(`users/${req.user.uid}`).once('value')).val() || {};
-    if (['owner', 'admin'].includes(String(profile.role || '').toLowerCase())) {
+    const profileEmail = String(profile.email || req.user.email || '').toLowerCase();
+    if (['owner', 'admin'].includes(String(profile.role || '').toLowerCase()) || OWNER_EMAILS.includes(profileEmail)) {
       return res.status(403).json({ error: 'A conta do proprietário ou administrador não pode ser excluída por esta opção.' });
     }
-    const result = await deleteUserCompletely(req.user.uid);
-    return res.json({ success: true, ...result });
+    const result = await deleteUserCompletely(req.user.uid, { actorUid: req.user.uid, source: 'self' });
+    return res.json({ success: true, message: 'Sua conta e todos os dados foram excluídos.', ...result });
   } catch (error) {
     console.error('account/delete:', error);
     return res.status(500).json({ error: error.message || 'Não foi possível excluir completamente sua conta.' });
@@ -748,11 +799,8 @@ async function selfDeleteUserHandler(req, res) {
 }
 
 const selfDeleteRoutes = [
-  '/account/delete',
-  '/account/delete-complete',
-  '/api/account/delete',
-  '/deleteAccount',
-  '/delete-my-account'
+  '/account/delete','/account/delete-complete','/account/deleteUser','/api/account/delete',
+  '/api/account/delete-complete','/deleteAccount','/delete-my-account'
 ];
 for (const route of selfDeleteRoutes) {
   app.post(route, authenticate, selfDeleteUserHandler);
