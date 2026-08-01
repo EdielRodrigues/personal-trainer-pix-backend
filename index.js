@@ -304,14 +304,14 @@ async function syncPayment(payment, suppliedLocalPayment) {
 }
 
 app.get('/', (req, res) => {
-  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.0.0', pixFix: 'v8-webhook-e-exclusao-unificada', timestamp: new Date().toISOString() });
+  res.json({ online: true, service: 'Finance IA Pro Pix', version: '5.1.0', pixFix: 'v8.1-pix-persistente-exclusao-uid', timestamp: new Date().toISOString() });
 });
 
 app.get('/health', (req, res) => {
   res.json({
     success: true,
-    version: '5.0.0',
-    pixFix: 'v8-webhook-e-exclusao-unificada',
+    version: '5.1.0',
+    pixFix: 'v8.1-pix-persistente-exclusao-uid',
     firebase: true,
     mercadoPagoToken: Boolean(process.env.MERCADO_PAGO_ACCESS_TOKEN),
     webhookSecret: Boolean(process.env.MERCADO_PAGO_WEBHOOK_SECRET),
@@ -562,6 +562,41 @@ app.get('/paymentStatus', authenticate, async (req, res) => {
   }
 });
 
+
+async function expirePendingPaymentIfNeeded(paymentId, local) {
+  const status = String(local?.status || '').toLowerCase();
+  if (!['pending','in_process','authorized','unknown'].includes(status)) return local;
+  const expiryMs = Date.parse(local?.expiresAt || local?.paymentExpiresAt || '');
+  if (!Number.isFinite(expiryMs) || expiryMs > Date.now()) return local;
+
+  let finalStatus = 'expired';
+  try {
+    const remote = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`);
+    if (String(remote.status || '').toLowerCase() === 'approved') {
+      await syncPayment(remote, local);
+      return (await db.ref(`payments/${paymentId}`).once('value')).val() || local;
+    }
+    if (['pending','in_process','authorized'].includes(String(remote.status || '').toLowerCase())) {
+      try {
+        const cancelled = await mpRequest(`/v1/payments/${encodeURIComponent(paymentId)}`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'cancelled' })
+        });
+        finalStatus = cancelled.status || 'cancelled';
+      } catch (cancelError) {
+        console.warn(`Não foi possível cancelar o Pix vencido ${paymentId}:`, cancelError.message);
+      }
+    } else {
+      finalStatus = remote.status || 'expired';
+    }
+  } catch (error) {
+    console.warn(`Falha ao consultar Pix vencido ${paymentId}:`, error.message);
+  }
+  const now = new Date().toISOString();
+  await db.ref(`payments/${paymentId}`).update({ status: finalStatus, expiredAt: now, updatedAt: now });
+  return (await db.ref(`payments/${paymentId}`).once('value')).val() || { ...local, status: finalStatus, expiredAt: now };
+}
+
 app.get('/latestPayment', authenticate, async (req, res) => {
   try {
     const snapshot = await db.ref('payments')
@@ -577,8 +612,9 @@ app.get('/latestPayment', authenticate, async (req, res) => {
 
     // Confere no Mercado Pago as cobranças ainda não finalizadas. Isso resolve
     // pagamentos feitos com o app aberto, em segundo plano ou fechado.
-    for (const [id, local] of entries.slice(0, 10)) {
-      if (['approved','rejected','cancelled','refunded','charged_back'].includes(String(local.status || '').toLowerCase())) continue;
+    for (const [id, originalLocal] of entries.slice(0, 10)) {
+      const local = await expirePendingPaymentIfNeeded(id, originalLocal);
+      if (['approved','rejected','cancelled','expired','refunded','charged_back'].includes(String(local.status || '').toLowerCase())) continue;
       try {
         const remote = await mpRequest(`/v1/payments/${encodeURIComponent(id)}`);
         await syncPayment(remote, local);
@@ -600,11 +636,27 @@ app.get('/latestPayment', authenticate, async (req, res) => {
     console.error('latestPayment:', error);
     res.status(500).json({ error: error.message || 'Não foi possível buscar o pagamento.' });
   }
+ });
+
+app.get('/myPayments', authenticate, async (req, res) => {
+  try {
+    const snapshot = await db.ref('payments').orderByChild('userId').equalTo(req.user.uid).once('value');
+    const entries = Object.entries(snapshot.val() || {}).sort((a,b) =>
+      Date.parse(b[1]?.createdAt || b[1]?.updatedAt || 0) - Date.parse(a[1]?.createdAt || a[1]?.updatedAt || 0)
+    );
+    const result = [];
+    for (const [id, original] of entries.slice(0, 30)) {
+      const current = await expirePendingPaymentIfNeeded(id, original);
+      result.push({ id, ...current });
+    }
+    res.json({ success: true, payments: result });
+  } catch (error) {
+    console.error('myPayments:', error);
+    res.status(500).json({ error: error.message || 'Não foi possível carregar os pagamentos.' });
+  }
 });
 
-
-
-app.post('/reconcilePendingPayments', authenticateAdmin, async (req, res) => {
+app.post('/reconcilePendingPayments' , authenticateAdmin, async (req, res) => {
   try {
     const snap = await db.ref('payments').once('value');
     const all = snap.val() || {};
@@ -674,6 +726,18 @@ async function deleteUserCompletely(targetUid, context = {}) {
     'pushTokens','fcmTokens','devices','userDevices','activity','userActivity'
   ];
   uidRoots.forEach(path => { updates[`${path}/${targetUid}`] = null; });
+
+
+  // Remove qualquer pasta criada diretamente com o UID, inclusive estruturas antigas não previstas.
+  for (const [topKey, topValue] of Object.entries(root)) {
+    if (!topValue || typeof topValue !== 'object' || Array.isArray(topValue)) continue;
+    if (Object.prototype.hasOwnProperty.call(topValue, targetUid)) updates[`${topKey}/${targetUid}`] = null;
+    for (const [childKey, childValue] of Object.entries(topValue)) {
+      if (!childValue || typeof childValue !== 'object' || Array.isArray(childValue)) continue;
+      const linkedUid = String(childValue.userId || childValue.uid || childValue.ownerUid || childValue.firebaseUid || '');
+      if (linkedUid === targetUid) updates[`${topKey}/${childKey}`] = null;
+    }
+  }
 
   // Remove índices de CPF em todos os formatos e qualquer entrada ligada ao UID/e-mail.
   for (const indexRoot of cpfIndexRoots) {
@@ -937,5 +1001,5 @@ setTimeout(reconcileRecentPendingPayments, 15000).unref();
 
 const PORT = Number(process.env.PORT || 10000);
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Personal Trainer Pix online na porta ${PORT}`);
+  console.log(`Finance IA Pro Pix online na porta ${PORT}`);
 });
