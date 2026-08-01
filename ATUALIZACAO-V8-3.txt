@@ -1,6 +1,0 @@
-V8.3 — Programa de indicação
-
-- Rotas de indicação.
-- Registro de acessos e cadastros.
-- Bônus automático de +1 dia via webhook após primeiro pagamento aprovado.
-- Proteção contra bônus duplicado e autoindicação.
